@@ -3,12 +3,13 @@ Vector store implementation with Markdown chunking and Ollama embeddings.
 """
 import os
 import re
+import asyncio
+import aiohttp
 from typing import Optional, Dict, List, Union, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 import uuid
-import requests
-
+from .config import EmbeddingModelConfig, ConfigManager
 import chromadb
 from chromadb.config import Settings
 import markdown
@@ -126,17 +127,19 @@ class MarkdownChunker:
             
         return chunks
 
-class OllamaEmbeddingClient:
-    """Client for generating embeddings using Ollama's nomic-embed-text model."""
+# ============================================================================
+# Embedding Client
+# ============================================================================
+
+class EmbeddingLLMError(Exception):
+    """Base exception for EmbeddingLLMClient errors"""
+    pass
+
+class EmbeddingLLMClient:
+    """LLM Client for generating embeddings."""
     
-    def __init__(self, base_url: str = "http://localhost:11434"):
-        """
-        Initialize the embedding client.
-        
-        Args:
-            base_url: Base URL for Ollama API
-        """
-        self.base_url = base_url
+    def __init__(self, embedding_config: EmbeddingModelConfig):
+        self.embedding_config = embedding_config
         
     async def generate_embeddings(self, texts: Union[str, List[str]], timeout: int = 30) -> Union[List[float], List[List[float]]]:
         """
@@ -151,32 +154,33 @@ class OllamaEmbeddingClient:
             or list of embeddings for multiple texts
             
         Raises:
-            requests.Timeout: If request times out
-            requests.RequestException: If request fails
+            EmbeddingLLMError: If request fails or times out
         """
         if isinstance(texts, str):
             texts = [texts]
             
         try:
             embeddings = []
-            for text in texts:
-                response = requests.post(
-                    f"{self.base_url}/api/embeddings",
-                    json={
-                        "model": "nomic-embed-text",
-                        "prompt": text
-                    },
-                    timeout=timeout
-                )
-                response.raise_for_status()
-                embeddings.append(response.json()["embedding"])
-                
+            async with aiohttp.ClientSession() as session:
+                for text in texts:
+                    async with session.post(
+                        f"{self.embedding_config.host}/api/embeddings",
+                        json={
+                            "model": self.embedding_config.name,
+                            "prompt": text
+                        },
+                        timeout=aiohttp.ClientTimeout(total=timeout)
+                    ) as response:
+                        response.raise_for_status()
+                        data = await response.json()
+                        embeddings.append(data["embedding"])
+                        
             return embeddings[0] if len(texts) == 1 else embeddings
                 
-        except requests.Timeout:
-            raise RuntimeError("Request to Ollama timed out")
-        except requests.RequestException as e:
-            raise RuntimeError(f"Failed to connect to Ollama: {str(e)}")
+        except asyncio.TimeoutError:
+            raise EmbeddingLLMError("Request to Ollama timed out")
+        except aiohttp.ClientError as e:
+            raise EmbeddingLLMError(f"Failed to connect to Ollama: {str(e)}")
 
 class DocumentProcessor:
     """Handles loading and processing of different document types."""
@@ -198,7 +202,7 @@ class DocumentProcessor:
 class VectorStore:
     """Manages document embeddings and similarity search using ChromaDB."""
     
-    def __init__(self, project_path: str, chunk_size: int = 512):
+    def __init__(self, project_path: str, embedding_config: EmbeddingModelConfig, chunk_size: int = 512):
         """
         Initialize the vector store.
         
@@ -208,17 +212,17 @@ class VectorStore:
         """
         self.project_path = project_path
         self.persist_dir = os.path.join(project_path, '.llama', 'vector_store')
-        self.embedding_client = OllamaEmbeddingClient()
+        self.embedding_client = EmbeddingLLMClient(embedding_config)
         self.chunker = MarkdownChunker(max_chunk_size=chunk_size)
         
         # Ensure storage directory exists
         os.makedirs(self.persist_dir, exist_ok=True)
         
         # Initialize ChromaDB client
-        self.client = chromadb.Client(Settings(
-            persist_directory=self.persist_dir,
-            anonymized_telemetry=False
-        ))
+        self.client = chromadb.PersistentClient(
+            path=self.persist_dir,
+            settings=chromadb.Settings(allow_reset=True)
+        )
         
         # Create or get our collection
         self.collection = self.client.get_or_create_collection(
@@ -231,48 +235,66 @@ class VectorStore:
         return self.collection
     
     def reset(self):
-        """Reset the vector store by deleting and recreating the collection."""
-        self.client.delete_collection("documents")
+        """Reset the vector store by deleting all data and recreating the collection."""
+        # Delete all collections
+        self.client.reset()
+        
+        # Create our collection
         self.collection = self.client.create_collection(
             name="documents",
-            metadata={"hnsw:space": "cosine"}
+            metadata={"hnsw:space": "cosine"}  # Use cosine similarity
         )
         
     async def add_document(self, file_path: Union[str, Path], metadata: Optional[Dict] = None):
         """
         Add a document to the vector store.
-        
+
         Args:
             file_path: Path to the document
             metadata: Optional metadata about the document
         """
-        file_path = Path(file_path)
-        base_metadata = {
-            "path": str(file_path),
-            "filename": file_path.name,
-            **(metadata or {})
-        }
-        
-        # Process based on file type
-        if file_path.suffix.lower() == '.md':
-            content = DocumentProcessor.load_markdown(file_path)
-        else:
-            raise ValueError(f"Unsupported file type: {file_path.suffix}")
+        try:
+            file_path = Path(file_path)
+            base_metadata = {
+                "path": str(file_path),
+                "filename": file_path.name,
+                **(metadata or {})
+            }
             
-        # Chunk the document
-        chunks = self.chunker.chunk_document(content, base_metadata)
-        
-        # Generate embeddings for all chunks
-        chunk_texts = [chunk.content for chunk in chunks]
-        embeddings = await self.embedding_client.generate_embeddings(chunk_texts)
-        
-        # Add chunks to ChromaDB
-        self.collection.add(
-            embeddings=embeddings,
-            documents=[chunk.content for chunk in chunks],
-            metadatas=[chunk.metadata for chunk in chunks],
-            ids=[chunk.id for chunk in chunks]
-        )
+            # Process based on file type
+            if file_path.suffix.lower() == '.md':
+                print(f"Reading content from: {file_path}")
+                content = DocumentProcessor.load_markdown(file_path)
+                print(f"Content length: {len(content)} characters")
+            else:
+                raise ValueError(f"Unsupported file type: {file_path.suffix}")
+            
+            # Chunk the document
+            print("Chunking document...")
+            chunks = self.chunker.chunk_document(content, base_metadata)
+            print(f"Created {len(chunks)} chunks")
+            
+            # Generate embeddings for all chunks
+            print("Generating embeddings...")
+            chunk_texts = [chunk.content for chunk in chunks]
+            embeddings = await self.embedding_client.generate_embeddings(chunk_texts)
+            print(f"Generated {len(embeddings)} embeddings")
+            
+            # Add chunks to ChromaDB
+            try:
+                print("Adding to ChromaDB...")
+                await asyncio.to_thread(
+                    self.collection.add,
+                    embeddings=embeddings,
+                    documents=[chunk.content for chunk in chunks],
+                    metadatas=[chunk.metadata for chunk in chunks],
+                    ids=[chunk.id for chunk in chunks]
+                )
+                print("Successfully added to ChromaDB")
+            except Exception as e:
+                raise RuntimeError(f"Failed to add documents to ChromaDB: {str(e)}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to process document {file_path}: {str(e)}")
         
     async def add_documents(self, directory: Union[str, Path], metadata: Optional[Dict] = None):
         """
@@ -283,9 +305,16 @@ class VectorStore:
             metadata: Optional metadata to apply to all documents
         """
         directory = Path(directory)
+        files_processed = 0
+        print(f"Scanning directory: {directory}")
+        
         for file_path in directory.rglob('*'):
             if file_path.suffix.lower() == '.md':
+                print(f"Processing file: {file_path}")
                 await self.add_document(file_path, metadata)
+                files_processed += 1
+        
+        print(f"Processed {files_processed} files")
                 
     def _chunks_to_documents(self, chunks: List[Dict]) -> List[Dict]:
         """
@@ -344,27 +373,35 @@ class VectorStore:
         Returns:
             List of results with document content and metadata
         """
-        # Generate query embedding
-        query_embedding = await self.embedding_client.generate_embeddings(text)
-        
-        # Search collection - get more chunks than documents requested
-        chunk_results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results * 3,  # Get extra chunks to ensure good document coverage
-            include=["documents", "metadatas", "distances"]
-        )
-        
-        # Format chunk results
-        formatted_chunks = []
-        for i in range(len(chunk_results['ids'][0])):
-            formatted_chunks.append({
-                'document': chunk_results['documents'][0][i],
-                'metadata': chunk_results['metadatas'][0][i],
-                'distance': chunk_results['distances'][0][i]
-            })
+        try:
+            # Generate query embedding
+            query_embedding = await self.embedding_client.generate_embeddings(text)
             
-        # Convert chunks to document results
-        doc_results = self._chunks_to_documents(formatted_chunks)
-        
-        # Return requested number of documents
-        return doc_results[:n_results]
+            # Search collection - get more chunks than documents requested
+            try:
+                chunk_results = await asyncio.to_thread(
+                    self.collection.query,
+                    query_embeddings=[query_embedding],
+                    n_results=n_results * 3,  # Get extra chunks to ensure good document coverage
+                    include=["documents", "metadatas", "distances"]
+                )
+                
+                # Format chunk results
+                formatted_chunks = []
+                for i in range(len(chunk_results['ids'][0])):
+                    formatted_chunks.append({
+                        'document': chunk_results['documents'][0][i],
+                        'metadata': chunk_results['metadatas'][0][i],
+                        'distance': chunk_results['distances'][0][i]
+                    })
+                
+                # Convert chunks to document results
+                doc_results = self._chunks_to_documents(formatted_chunks)
+                
+                # Return requested number of documents
+                return doc_results[:n_results]
+                
+            except Exception as e:
+                raise RuntimeError(f"Failed to query ChromaDB: {str(e)}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to process query: {str(e)}")

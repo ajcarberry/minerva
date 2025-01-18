@@ -1,86 +1,19 @@
 # agent.py
-from dataclasses import dataclass
 from typing import List, Dict, Optional, Callable
 import os
-import yaml
 import time
 import json
 import difflib
 import threading
+import asyncio
+from .config import PathConfig, EditingConfig, AgentModelConfig, ConfigManager
+from .vector_store import VectorStore
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import requests
 from prompt_toolkit import prompt
 from prompt_toolkit.history import FileHistory
-
-# ============================================================================
-# Configuration Classes
-# ============================================================================
-
-@dataclass
-class ModelConfig:
-    """Configuration for the LLM model"""
-    name: str
-    context_window: int
-    temperature: float
-    host: str = "http://localhost:11435"
-
-@dataclass
-class PathConfig:
-    """Configuration for file paths and extensions"""
-    exclude: List[str]
-    watch_extensions: List[str]
-
-@dataclass
-class EditingConfig:
-    """Configuration for document editing behavior"""
-    backup: bool
-    backup_dir: str
-    require_approval: bool
-
-class ConfigManager:
-    """Handles configuration loading and management"""
-    
-    def __init__(self, project_path: str):
-        self.project_path = project_path
-        self.config_path = os.path.join(project_path, '.llama', 'config.yaml')
-        self.load_config()
-
-    def load_config(self) -> None:
-        """Load configuration from file or create default"""
-        try:
-            with open(self.config_path, 'r') as f:
-                config_data = yaml.safe_load(f)
-        except FileNotFoundError:
-            config_data = self._create_default_config()
-            
-        self.model_config = ModelConfig(**config_data['model'])
-        self.path_config = PathConfig(**config_data['paths'])
-        self.editing_config = EditingConfig(**config_data['editing'])
-
-    def _create_default_config(self) -> Dict:
-        """Create and save default configuration"""
-        config = {
-            'model': {
-                'name': 'llama3.2',
-                'context_window': 4096,
-                'temperature': 0.7
-            },
-            'paths': {
-                'exclude': ['.obsidian/*', '.git/*'],
-                'watch_extensions': ['.md']
-            },
-            'editing': {
-                'backup': True,
-                'backup_dir': '.llama/backups',
-                'require_approval': True
-            }
-        }
-        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-        with open(self.config_path, 'w') as f:
-            yaml.dump(config, f, default_flow_style=False)
-        return config
 
 # ============================================================================
 # Document Management
@@ -209,14 +142,14 @@ class FileWatcher:
         return MarkdownHandler(self.on_file_changed)
 
 # ============================================================================
-# LLM Client
+# Agent LLM Client
 # ============================================================================
 
-class LlamaError(Exception):
-    """Base exception for LlamaClient errors"""
+class AgentLLMError(Exception):
+    """Base exception for AgentLLMClient errors"""
     pass
 
-class LlamaClient:
+class AgentLLMClient:
     """Handles LLM interactions"""
     
     DEFAULT_SYSTEM_PROMPT = (
@@ -238,8 +171,8 @@ class LlamaClient:
         "You provide clear, informative feedback while being engaging and conversational. "
     )
     
-    def __init__(self, model_config: ModelConfig):
-        self.model_config = model_config
+    def __init__(self, agent_config: AgentModelConfig):
+        self.agent_config = agent_config
         self.message_history = []  # Add message history storage
         
     def query_llama(
@@ -268,12 +201,12 @@ class LlamaClient:
         
         try:
             response = requests.post(
-                f'{self.model_config.host}/api/generate',
+                f'{self.agent_config.host}/api/generate',
                 json={
-                    "model": self.model_config.name,
+                    "model": self.agent_config.name,
                     "prompt": "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages]),
                     "system": system_prompt,
-                    "temperature": self.model_config.temperature
+                    "temperature": self.agent_config.temperature
                 },
                 stream=True,
                 timeout=30
@@ -289,9 +222,9 @@ class LlamaClient:
             return result
             
         except requests.Timeout:
-            raise LlamaError("Request to Llama timed out")
+            raise AgentLLMError("Request to Llama timed out")
         except requests.RequestException as e:
-            raise LlamaError(f"Failed to connect to Llama: {str(e)}")
+            raise AgentLLMError(f"Failed to connect to Llama: {str(e)}")
             
     def _build_system_prompt(self, persona: str, context: Optional[List[Document]] = None) -> str:
         """Build system prompt based on persona and context"""
@@ -329,7 +262,7 @@ class LlamaClient:
                     continue
                     
         if not full_response:
-            raise LlamaError("Empty response from Llama")
+            raise AgentLLMError("Empty response from Llama")
                     
         print()  # Add newline at the end
         return {"response": full_response}
@@ -354,7 +287,12 @@ class LlamaAgent:
             self.config_manager.path_config
         )
         
-        self.llm_client = LlamaClient(self.config_manager.model_config)
+        self.llm_client = AgentLLMClient(self.config_manager.agent_config)
+        
+        self.vector_store = VectorStore(
+            project_path=project_path,
+            embedding_config=self.config_manager.embedding_config
+        )
         
         self.file_watcher = FileWatcher(
             os.path.join(project_path, 'docs'),
@@ -403,8 +341,56 @@ class LlamaAgent:
             except EOFError:
                 break
 
-    def _handle_command(self, command: str) -> None:
-        """Handle user commands"""
+    async def _search_knowledge(self, query: str) -> None:
+        """Search the vector store for relevant documents"""
+        try:
+            print("\nSearching knowledge base...")
+            results = await self.vector_store.query(query)
+            
+            if not results:
+                print("No relevant documents found.")
+                return
+                
+            print(f"\nFound {len(results)} relevant documents:")
+            for i, result in enumerate(results, 1):
+                print(f"\n{i}. {result['metadata']['filename']} (similarity: {1 - result['distance']:.2f})")
+                print("-" * 40)
+                print(result['document'][:300] + "..." if len(result['document']) > 300 else result['document'])
+        except Exception as e:
+            print(f"\nError searching knowledge base: {str(e)}")
+            
+    async def _update_knowledge(self) -> None:
+        """Update the vector store with document embeddings"""
+        try:
+            print("\nUpdating knowledge base...")
+            docs_path = os.path.join(self.project_path, 'docs')
+            await self.vector_store.add_documents(docs_path)
+            print("Knowledge base updated successfully!")
+        except Exception as e:
+            print(f"\nError updating knowledge base: {str(e)}")
+
+    async def _reset_knowledge(self) -> None:
+        """Reset the vector store, clearing all documents"""
+        try:
+            print("\nResetting knowledge base...")
+            self.vector_store.reset()
+            print("Knowledge base reset successfully!")
+        except Exception as e:
+            print(f"\nError resetting knowledge base: {str(e)}")
+
+    async def _handle_command_async(self, command: str) -> None:
+        """Handle user commands that may require async operations"""
+        if command == 'update-knowledge':
+            await self._update_knowledge()
+        elif command == 'reset-knowledge':
+            await self._reset_knowledge()
+        elif command.startswith('search '):
+            await self._search_knowledge(command[7:])
+        else:
+            self._handle_command_sync(command)
+
+    def _handle_command_sync(self, command: str) -> None:
+        """Handle synchronous user commands"""
         if command == 'help':
             self._show_help()
         elif command == 'list':
@@ -419,6 +405,10 @@ class LlamaAgent:
             self._handle_edit_command(command[5:])
         else:
             print("Unknown command. Type 'help' for available commands.")
+
+    def _handle_command(self, command: str) -> None:
+        """Handle user commands with async support"""
+        asyncio.run(self._handle_command_async(command))
 
     def _handle_archive_command(self) -> None:
         """Handle the 'archive' command - clean up backup files"""
@@ -481,7 +471,7 @@ class LlamaAgent:
                         persona="chat",
                         preserve_history=True  # Enable history for chat mode
                     )
-                except LlamaError as e:
+                except AgentLLMError as e:
                     print(f"\nError: {str(e)}")
                     
             except KeyboardInterrupt:
@@ -514,7 +504,10 @@ class LlamaAgent:
         print("  list: Show all documents")
         print("  chat: Start an interactive chat with Llama")
         print("  archive: Clean up all backup files")
+        print("  update-knowledge: Update vector store with document embeddings")
+        print("  reset-knowledge: Reset vector store, clearing all documents")
         print("  help: Show this help message")
+        print("  search <query>: Search knowledge base for relevant documents")
         print("  exit: Exit the application")
 
     def _handle_new_command(self, filename: str) -> None:
@@ -604,7 +597,7 @@ class LlamaAgent:
                 else:
                     print("\nError: Could not find content marker in response")
             
-        except LlamaError as e:
+        except AgentLLMError as e:
             print(f"\nError getting suggestions: {str(e)}")
 
     def _handle_save_command(self, content: str, doc: Document) -> None:
