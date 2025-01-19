@@ -1,15 +1,32 @@
-# Local LLM Agent for Markdown Files
+# Minerva: AI-Powered Product Management Assistant
 
-A Python-based agent that uses Ollama to provide local LLM capabilities for managing and editing markdown files. The agent maintains context of your entire document collection and allows for interactive editing and suggestions.
+Minerva is an intelligent assistant designed to streamline product management workflows through automated research, documentation, and knowledge management. It combines the power of local LLM capabilities with persistent memory to enhance your product management process.
 
 ## Features
 
-- 📝 Real-time file monitoring and context updates
-- 🤖 Local LLM integration through Ollama
-- ⚡ Interactive command interface
-- 🔄 Automatic context maintenance
-- 💾 Backup system for safe editing
-- ⚙️ Configurable through YAML
+- 🧠 Intelligent Knowledge Management
+  - Vector store integration for semantic search
+  - Automatic context maintenance
+  - Document ingestion and processing
+  - Real-time file monitoring and updates
+
+- 📝 Document Management
+  - Markdown file editing and suggestions
+  - Interactive command interface
+  - Automated content improvements
+  - Backup system for safe editing
+
+- 🤖 AI Integration
+  - Local LLM integration through Ollama
+  - Context-aware responses
+  - Intelligent document analysis
+  - Automated improvement suggestions
+
+- ⚙️ Customization
+  - Configurable through YAML
+  - Extensible architecture
+  - Flexible document handling
+  - Custom prompts support
 
 ## Prerequisites
 
@@ -26,8 +43,8 @@ curl -sSL https://install.python-poetry.org | python3 -
 
 2. Clone the repository:
 ```bash
-git clone <your-repo-url>
-cd local_agent
+git clone https://github.com/ajcarberry/minerva.git
+cd minerva
 ```
 
 3. Install dependencies:
@@ -37,7 +54,7 @@ poetry install
 
 4. Install the Llama model in Ollama:
 ```bash
-ollama pull llama3.2
+ollama pull llama2
 ```
 
 ## Usage
@@ -47,36 +64,44 @@ ollama pull llama3.2
 nohup sh -c 'OLLAMA_HOST=127.0.0.1:11435 ollama serve' > ollama.log 2>&1 &
 ```
 
-2. Run the agent:
+2. Run Minerva:
 ```bash
 poetry run python agent.py
 ```
 
 ### Available Commands
 
+#### Document Management
 - `edit <filename>`: Enter edit mode for a specific file
 - `context`: Show current document context
 - `refresh`: Reload all documents
 - `status`: Show current configuration and status
+
+#### Knowledge Management
+- `learn <directory>`: Ingest new documents into the knowledge base
+- `query <text>`: Search the knowledge base using semantic search
+- `suggest <filename>`: Get AI-powered improvement suggestions
+- `chat`: Enter interactive chat mode with context awareness
+
+#### System Commands
+- `config`: View or modify configuration
+- `backup`: Create a backup of current documents
 - `exit`: Quit the application
-
-### Edit Mode Commands
-
-When in edit mode (`edit <filename>`):
-- `suggest`: Get improvement suggestions from Llama
-- `review`: Review current file content
-- `save`: Save changes
-- `exit`: Exit edit mode
 
 ## Configuration
 
-Configuration is stored in `.llama/config.yaml`:
+Configuration is stored in `config.yaml`:
 
 ```yaml
 model:
   name: llama2
   context_window: 4096
   temperature: 0.7
+
+vector_store:
+  engine: "faiss"  # Vector store backend
+  dimension: 384   # Embedding dimension
+  index_path: ".minerva/vector_store"
 
 paths:
   exclude:
@@ -87,19 +112,26 @@ paths:
 
 editing:
   backup: true
-  backup_dir: ".llama/backups"
+  backup_dir: ".minerva/backups"
   require_approval: true
 ```
 
 ## Project Structure
 
 ```
-local_agent/
-├── .llama/
-│   └── config.yaml     # Configuration file
-├── docs/              # Your markdown files
-├── agent.py          # Main application
-└── README.md         # This file
+minerva/
+├── .minerva/
+│   ├── config.yaml        # Configuration file
+│   ├── vector_store/      # Vector store indices
+│   └── backups/          # Document backups
+├── agent/
+│   ├── __init__.py
+│   ├── agent.py          # Core agent functionality
+│   ├── document.py       # Document management
+│   ├── knowledge.py      # Knowledge management
+│   └── ui.py            # User interface
+├── docs/                # Documentation
+└── README.md           # This file
 ```
 
 ## Development
@@ -132,16 +164,20 @@ poetry shell
 
 ### Common Issues
 
-1. **Ollama Connection Error**
+1. **Vector Store Initialization**
+   - Ensure proper permissions for the vector store directory
+   - Check if the embedding model is downloaded
+   - Verify vector store configuration
+
+2. **Ollama Connection**
    - Ensure Ollama is running (`ollama serve`)
    - Check if the Llama model is installed (`ollama list`)
+   - Verify the OLLAMA_HOST configuration
 
-2. **File Monitoring Issues**
+3. **Document Processing**
    - Check file permissions
    - Verify paths in config.yaml
-
-3. **Python SSL Error**
-   - If you encounter SSL errors, ensure you're using Poetry's virtual environment
+   - Ensure proper file encoding
 
 ### Getting Help
 
@@ -149,10 +185,13 @@ poetry shell
 - Check the Ollama documentation
 - Review the Poetry documentation
 
-## Todo / Roadmap
+## Roadmap
 
 - [ ] Add support for multiple LLM models
-- [ ] Implement concurrent file processing
+- [ ] Implement concurrent document processing
 - [ ] Add web interface
-- [ ] Improve diff visualization
-- [ ] Add support for custom prompts
+- [ ] Enhance semantic search capabilities
+- [ ] Add document version control
+- [ ] Implement collaborative editing
+- [ ] Add custom workflow automation
+- [ ] Enhance API integration capabilities
