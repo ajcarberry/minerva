@@ -362,6 +362,95 @@ class VectorStore:
         results.sort(key=lambda x: x['distance'])
         return results
                 
+    async def _preprocess_query(self, query: str) -> List[str]:
+        """
+        Preprocess the query text for embedding.
+        
+        For longer queries, splits into chunks to match document chunking.
+        For shorter queries, returns as single chunk.
+        
+        Args:
+            query: The query text
+            
+        Returns:
+            List of query chunks
+        """
+        # Clean and normalize query text
+        query = query.strip()
+        
+        # For very short queries, no need to chunk
+        if len(query) < 100:  # Approximate threshold
+            return [query]
+            
+        # Create metadata dict for chunking
+        query_metadata = {
+            "type": "query",
+            "original_text": query[:100] + "..." if len(query) > 100 else query
+        }
+        
+        # Use same chunking logic as documents
+        chunks = self.chunker.chunk_document(query, query_metadata)
+        return [chunk.content for chunk in chunks]
+
+    async def _generate_query_embeddings(self, query_chunks: List[str]) -> List[List[float]]:
+        """
+        Generate embeddings for query chunks.
+        
+        Args:
+            query_chunks: List of query text chunks
+            
+        Returns:
+            List of embeddings for each chunk
+        """
+        try:
+            # Generate embeddings for all chunks
+            embeddings = await self.embedding_client.generate_embeddings(query_chunks)
+            
+            # Handle single chunk case
+            if len(query_chunks) == 1:
+                return [embeddings]  # Wrap single embedding in list
+            return embeddings
+            
+        except EmbeddingLLMError as e:
+            raise RuntimeError(f"Failed to generate query embeddings: {str(e)}")
+
+    async def _search_chunks(self, query_embeddings: List[List[float]], n_results: int = 5) -> List[Dict]:
+        """
+        Search for similar chunks using query embeddings.
+        
+        Args:
+            query_embeddings: List of query chunk embeddings
+            n_results: Number of results to return per query embedding
+            
+        Returns:
+            Combined and deduplicated search results
+        """
+        try:
+            all_results = []
+            
+            # Search for each query embedding
+            for embedding in query_embeddings:
+                chunk_results = await asyncio.to_thread(
+                    self.collection.query,
+                    query_embeddings=[embedding],
+                    n_results=n_results,
+                    include=["documents", "metadatas", "distances"]
+                )
+                
+                # Format results
+                for i in range(len(chunk_results['ids'][0])):
+                    result = {
+                        'document': chunk_results['documents'][0][i],
+                        'metadata': chunk_results['metadatas'][0][i],
+                        'distance': chunk_results['distances'][0][i]
+                    }
+                    all_results.append(result)
+            
+            return all_results
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to search chunks: {str(e)}")
+
     async def query(self, text: str, n_results: int = 5) -> List[Dict]:
         """
         Query the vector store for similar documents.
@@ -374,34 +463,23 @@ class VectorStore:
             List of results with document content and metadata
         """
         try:
-            # Generate query embedding
-            query_embedding = await self.embedding_client.generate_embeddings(text)
+            # Preprocess and chunk query
+            query_chunks = await self._preprocess_query(text)
             
-            # Search collection - get more chunks than documents requested
-            try:
-                chunk_results = await asyncio.to_thread(
-                    self.collection.query,
-                    query_embeddings=[query_embedding],
-                    n_results=n_results * 3,  # Get extra chunks to ensure good document coverage
-                    include=["documents", "metadatas", "distances"]
-                )
-                
-                # Format chunk results
-                formatted_chunks = []
-                for i in range(len(chunk_results['ids'][0])):
-                    formatted_chunks.append({
-                        'document': chunk_results['documents'][0][i],
-                        'metadata': chunk_results['metadatas'][0][i],
-                        'distance': chunk_results['distances'][0][i]
-                    })
-                
-                # Convert chunks to document results
-                doc_results = self._chunks_to_documents(formatted_chunks)
-                
-                # Return requested number of documents
-                return doc_results[:n_results]
-                
-            except Exception as e:
-                raise RuntimeError(f"Failed to query ChromaDB: {str(e)}")
+            # Generate embeddings for query chunks
+            query_embeddings = await self._generate_query_embeddings(query_chunks)
+            
+            # Search for similar chunks
+            chunk_results = await self._search_chunks(
+                query_embeddings,
+                n_results=max(n_results, 3)  # Get extra results for better coverage
+            )
+            
+            # Deduplicate and combine results
+            doc_results = self._chunks_to_documents(chunk_results)
+            
+            # Return requested number of results
+            return doc_results[:n_results]
+            
         except Exception as e:
             raise RuntimeError(f"Failed to process query: {str(e)}")

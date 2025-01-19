@@ -162,7 +162,15 @@ class AgentLLMClient:
     CHAT_SYSTEM_PROMPT = (
         "You are a helpful AI assistant ready to discuss any topic. "
         "You provide clear, informative responses while being engaging and conversational. "
-        "You can help with analysis, explanations, creative tasks, or general discussion."
+        "You can help with analysis, explanations, creative tasks, or general discussion.\n\n"
+        "When provided with document content, you should:\n"
+        "1. Reference relevant information from the provided documents\n"
+        "2. Stay accurate to the document content when citing it\n"
+        "3. Clearly indicate when you're using information from documents\n"
+        "4. Provide helpful responses even when documents aren't relevant\n"
+        "5. Feel free to combine information from multiple documents\n"
+        "6. Acknowledge if the documents don't address the question\n"
+        "7. Use phrases like 'According to [document]...' when citing"
     )
 
     EXEC_SYSTEM_PROMPT = (
@@ -171,8 +179,9 @@ class AgentLLMClient:
         "You provide clear, informative feedback while being engaging and conversational. "
     )
     
-    def __init__(self, agent_config: AgentModelConfig):
+    def __init__(self, agent_config: AgentModelConfig, project_path: str):
         self.agent_config = agent_config
+        self.project_path = project_path
         self.message_history = []  # Add message history storage
         
     def query_llama(
@@ -238,11 +247,26 @@ class AgentLLMClient:
         
         # Add context if provided
         if context:
-            system_prompt += "\n\nCurrent project context:\n"
-            system_prompt += "\n".join([
-                f"File: {doc.filename}\n{doc.content}\n---" 
-                for doc in context
-            ])
+            system_prompt += "\n\nRELEVANT DOCUMENTS:\n"
+            for doc in context:
+                rel_path = os.path.relpath(doc.path, os.path.join(self.project_path, 'docs'))
+                system_prompt += f"\n[{rel_path}]\n"
+                lines = doc.content.split('\n')
+                
+                # Add document content with clear structure
+                if lines:
+                    # Add title if first line is a header
+                    if lines[0].startswith('#'):
+                        system_prompt += f"Title: {lines[0].lstrip('#').strip()}\n"
+                    
+                    # Add content
+                    system_prompt += "Content:\n"
+                    system_prompt += '\n'.join(lines)
+                    system_prompt += "\n---\n"
+            
+            # Add explicit instructions for using context
+            system_prompt += "\nPlease reference these documents when they contain relevant information "
+            system_prompt += "by saying 'According to [filename]' or similar phrases."
             
         return system_prompt
         
@@ -287,7 +311,10 @@ class LlamaAgent:
             self.config_manager.path_config
         )
         
-        self.llm_client = AgentLLMClient(self.config_manager.agent_config)
+        self.llm_client = AgentLLMClient(
+            self.config_manager.agent_config,
+            project_path=project_path
+        )
         
         self.vector_store = VectorStore(
             project_path=project_path,
@@ -331,33 +358,31 @@ class LlamaAgent:
                 
                 if not command:
                     continue
-                    
                 if command == 'exit':
                     break
                     
-                self._handle_command(command)
+                asyncio.run(self._handle_command(command))
                     
             except KeyboardInterrupt:
                 continue
             except EOFError:
                 break
     
-    def _handle_command(self, command: str) -> None:
+    async def _handle_command(self, command: str) -> None:
         """Single command handler for both sync and async commands"""
-
-        # Handle async commands with asyncio.run()
         if command == 'help':
             self._show_help()
         elif command.startswith('edit'):
-            self._handle_edit_command(command[5:])
+            await self._handle_edit_command(command[5:])
         elif command.startswith('new'):
             self._handle_new_command(command[4:])
         elif command == 'chat':
-            self._handle_chat_command()
+            await self._handle_chat_command()
         elif command == 'tools':
-            self._handle_tools_command()
+            await self._handle_tools_command()
         else:
             print("Unknown command. Type 'help' for available commands.")
+        return None
 
     def _show_help(self) -> None:
         """Show available commands"""
@@ -369,10 +394,11 @@ class LlamaAgent:
         print("  help: Show available commands")
         print("  exit: Exit the application\n")
 
-    def _handle_chat_command(self) -> None:
-        """Handle the 'chat' command - interactive conversation with Llama"""
+    async def _handle_chat_command(self) -> None:
+        """Handle the 'chat' command - interactive conversation with Llama with vector store support"""
         print("\nEntering chat mode with Llama. Type 'exit' to return to main menu.")
-        print("Context: You can ask Llama questions or discuss topics.")
+        print("Context: You can ask questions about your documents or discuss any topic.")
+        print("I'll automatically search for relevant information in your documents.")
         
         # Clear history when starting new chat
         self.llm_client.clear_history()
@@ -389,12 +415,44 @@ class LlamaAgent:
                     break
                 
                 try:
+                    # Search vector store for relevant documents
+                    print("\nSearching knowledge base...", end='', flush=True)
+                    relevant_docs = await self.vector_store.query(user_input, n_results=3)
+                    
+                    if relevant_docs:
+                        print(f"\rFound {len(relevant_docs)} relevant documents:")
+                        for i, doc in enumerate(relevant_docs, 1):
+                            similarity = 1 - doc['distance']  # Convert distance to similarity score
+                            if similarity >= 0.7:  # Only show highly relevant docs
+                                print(f"  {i}. {doc['metadata']['filename']} (relevance: {similarity:.0%})")
+                    else:
+                        print("\rNo highly relevant documents found.")
+                    
+                    # Build context from relevant documents
+                    context_docs = []
+                    for doc in relevant_docs:
+                        similarity = 1 - doc['distance']
+                        if similarity >= 0.7:  # Only use highly relevant docs
+                            doc_path = Path(doc['metadata']['path'])
+                            if doc_path.exists():
+                                context_docs.append(self.document_manager.get_document(str(doc_path)))
+                    
+                    # Get LLM response with context
                     response = self.llm_client.query_llama(
                         prompt=user_input,
                         persona="chat",
+                        context=context_docs,  # Pass relevant documents as context
                         preserve_history=True  # Enable history for chat mode
                     )
-                except AgentLLMError as e:
+                    
+                    # Add citations if documents were used
+                    if context_docs:
+                        print("\nRelevant files referenced:")
+                        for doc in context_docs:
+                            rel_path = os.path.relpath(doc.path, self.document_manager.docs_path)
+                            print(f"- {rel_path}")
+                        
+                except Exception as e:
                     print(f"\nError: {str(e)}")
                     
             except KeyboardInterrupt:
@@ -410,7 +468,7 @@ class LlamaAgent:
         except (FileExistsError, IOError) as e:
             print(f"\nError: {str(e)}")
 
-    def _handle_edit_command(self, filename: str) -> None:
+    async def _handle_edit_command(self, filename: str) -> None:
         """Handle the 'edit' command"""
         if not filename.endswith('.md'):
             filename = f"{filename}.md"
@@ -427,7 +485,8 @@ class LlamaAgent:
         
         while True:
             try:
-                cmd = prompt('edit> ').strip()
+                # Use ainput or a non-event-loop-based input method
+                cmd = input('edit> ').strip()
                 
                 if not cmd:
                     continue
@@ -438,10 +497,10 @@ class LlamaAgent:
                     print(doc.content)
                     continue
                 if cmd.startswith('suggest'):
-                    self._handle_suggest_command(cmd, doc)
+                    await self._handle_suggest_command(cmd, doc)
                     continue
                 if cmd.startswith('save '):
-                    self._handle_save_command(cmd[5:], doc)
+                    await self._handle_save_command(cmd[5:], doc)
                     continue
                 if cmd == 'help':
                     self._show_edit_help()
@@ -461,7 +520,7 @@ class LlamaAgent:
         print("  help: Show available commands")
         print("  back: Return to main menu\n")
 
-    def _handle_suggest_command(self, cmd: str, doc: Document) -> None:
+    async def _handle_suggest_command(self, cmd: str, doc: Document) -> None:
         """Handle the 'suggest' command in edit mode"""
         try:
             # Extract focus area if provided
@@ -487,7 +546,7 @@ class LlamaAgent:
             if user_input.startswith('y'):
                 if '---CONTENT---' in response['response']:
                     new_content = response['response'].split('---CONTENT---', 1)[1].strip()
-                    self._save_with_backup(doc, new_content)
+                    await self._save_with_backup(doc, new_content)
                     print("\nChanges saved!")
                 else:
                     print("\nError: Could not find content marker in response")
@@ -495,15 +554,15 @@ class LlamaAgent:
         except AgentLLMError as e:
             print(f"\nError getting suggestions: {str(e)}")
 
-    def _handle_save_command(self, content: str, doc: Document) -> None:
+    async def _handle_save_command(self, content: str, doc: Document) -> None:
         """Handle the 'save' command in edit mode"""
         try:
-            self._save_with_backup(doc, content)
+            await self._save_with_backup(doc, content)
             print("\nChanges saved!")
         except IOError as e:
             print(f"\nError saving changes: {str(e)}")
 
-    def _save_with_backup(self, doc: Document, new_content: str) -> None:
+    async def _save_with_backup(self, doc: Document, new_content: str) -> None:
         """Save changes with backup if enabled"""
         if self.config_manager.editing_config.backup:
             # Create backup
@@ -528,33 +587,33 @@ class LlamaAgent:
         # Reload the document
         self.document_manager.load_document(doc.path)
 
-    def _handle_tools_command(self) -> None:
+    async def _handle_tools_command(self) -> None:
         """Handle the 'tools' command - troubleshooting and maintenance tools"""
         print("\nEntering tools mode.")
         self._show_tools_help()
         
         while True:
             try:
-                cmd = prompt('tools> ').strip()
+                cmd = input('tools> ').strip()
                 
                 if not cmd:
                     continue
                 if cmd == 'back':
                     break
                 if cmd == 'update':
-                    asyncio.run(self._update_knowledge())
+                    await self._update_knowledge()
                     continue
                 if cmd == 'reset':
-                    asyncio.run(self._reset_knowledge())
+                    await self._reset_knowledge()
                     continue
                 if cmd.startswith('search '):
-                    asyncio.run(self._search_knowledge(cmd[7:]))
+                    await self._search_knowledge(cmd[7:])
                     continue
                 if cmd == 'archive':
-                    self._handle_archive_command()
+                    await self._handle_archive_command()
                     continue
                 if cmd == 'list':
-                    self._handle_list_command()
+                    await self._handle_list_command()
                     continue
                 if cmd == 'help':
                     self._show_tools_help()
@@ -575,7 +634,7 @@ class LlamaAgent:
         print("  help: Show available commands")
         print("  back: Return to main menu\n")
 
-    def _handle_list_command(self) -> None:
+    async def _handle_list_command(self) -> None:
         """Handle the 'list' command"""
         documents = self.document_manager.documents
         
@@ -630,7 +689,7 @@ class LlamaAgent:
         except Exception as e:
             print(f"\nError resetting knowledge base: {str(e)}")
 
-    def _handle_archive_command(self) -> None:
+    async def _handle_archive_command(self) -> None:
         """Handle the 'archive' command - clean up backup files"""
         backup_dir = os.path.join(
             self.project_path,
