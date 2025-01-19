@@ -62,13 +62,13 @@ class ConfigManager:
         config = {
             'agent_model': {
                 'name': 'llama3.2',
-                'context_window': 4096,
+                'context_window': 8192,
                 'temperature': 0.7
             },
             'embedding_model': {
                 'name': 'nomic-embed-text',
-                'context_window': 4096,
-                'temperature': 0.7
+                'context_window': 8192,
+                'temperature': 0
             },
             'paths': {
                 'exclude': ['.obsidian/*', '.git/*'],
