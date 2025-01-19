@@ -322,7 +322,8 @@ class LlamaAgent:
         """Run the interactive command session"""
         history = FileHistory(os.path.join(self.project_path, '.llama', '.history'))
         
-        print("Welcome to LlamaAgent! Type 'help' for available commands.")
+        print("Welcome to LlamaAgent!")
+        self._show_help()
         
         while True:
             try:
@@ -340,111 +341,33 @@ class LlamaAgent:
                 continue
             except EOFError:
                 break
+    
+    def _handle_command(self, command: str) -> None:
+        """Single command handler for both sync and async commands"""
 
-    async def _search_knowledge(self, query: str) -> None:
-        """Search the vector store for relevant documents"""
-        try:
-            print("\nSearching knowledge base...")
-            results = await self.vector_store.query(query)
-            
-            if not results:
-                print("No relevant documents found.")
-                return
-                
-            print(f"\nFound {len(results)} relevant documents:")
-            for i, result in enumerate(results, 1):
-                print(f"\n{i}. {result['metadata']['filename']} (similarity: {1 - result['distance']:.2f})")
-                print("-" * 40)
-                print(result['document'][:300] + "..." if len(result['document']) > 300 else result['document'])
-        except Exception as e:
-            print(f"\nError searching knowledge base: {str(e)}")
-            
-    async def _update_knowledge(self) -> None:
-        """Update the vector store with document embeddings"""
-        try:
-            print("\nUpdating knowledge base...")
-            docs_path = os.path.join(self.project_path, 'docs')
-            await self.vector_store.add_documents(docs_path)
-            print("Knowledge base updated successfully!")
-        except Exception as e:
-            print(f"\nError updating knowledge base: {str(e)}")
-
-    async def _reset_knowledge(self) -> None:
-        """Reset the vector store, clearing all documents"""
-        try:
-            print("\nResetting knowledge base...")
-            self.vector_store.reset()
-            print("Knowledge base reset successfully!")
-        except Exception as e:
-            print(f"\nError resetting knowledge base: {str(e)}")
-
-    async def _handle_command_async(self, command: str) -> None:
-        """Handle user commands that may require async operations"""
-        if command == 'update-knowledge':
-            await self._update_knowledge()
-        elif command == 'reset-knowledge':
-            await self._reset_knowledge()
-        elif command.startswith('search '):
-            await self._search_knowledge(command[7:])
-        else:
-            self._handle_command_sync(command)
-
-    def _handle_command_sync(self, command: str) -> None:
-        """Handle synchronous user commands"""
+        # Handle async commands with asyncio.run()
         if command == 'help':
             self._show_help()
-        elif command == 'list':
-            self._handle_list_command()
-        elif command == 'archive':
-            self._handle_archive_command()
+        elif command.startswith('edit'):
+            self._handle_edit_command(command[5:])
+        elif command.startswith('new'):
+            self._handle_new_command(command[4:])
         elif command == 'chat':
             self._handle_chat_command()
-        elif command.startswith('new '):
-            self._handle_new_command(command[4:])
-        elif command.startswith('edit '):
-            self._handle_edit_command(command[5:])
+        elif command == 'tools':
+            self._handle_tools_command()
         else:
             print("Unknown command. Type 'help' for available commands.")
 
-    def _handle_command(self, command: str) -> None:
-        """Handle user commands with async support"""
-        asyncio.run(self._handle_command_async(command))
-
-    def _handle_archive_command(self) -> None:
-        """Handle the 'archive' command - clean up backup files"""
-        backup_dir = os.path.join(
-            self.project_path,
-            self.config_manager.editing_config.backup_dir
-        )
-        
-        if not os.path.exists(backup_dir):
-            print("\nNo backup directory found.")
-            return
-            
-        backup_count = 0
-        try:
-            # Walk through backup directory and remove .bak files
-            for root, _, files in os.walk(backup_dir):
-                for file in files:
-                    if file.endswith('.bak'):
-                        file_path = os.path.join(root, file)
-                        os.remove(file_path)
-                        backup_count += 1
-                        
-            # Remove empty directories
-            for root, dirs, files in os.walk(backup_dir, topdown=False):
-                for dir_name in dirs:
-                    dir_path = os.path.join(root, dir_name)
-                    if not os.listdir(dir_path):  # if directory is empty
-                        os.rmdir(dir_path)
-                        
-            if backup_count > 0:
-                print(f"\nCleaned up {backup_count} backup files.")
-            else:
-                print("\nNo backup files found.")
-                
-        except Exception as e:
-            print(f"\nError cleaning up backups: {str(e)}")
+    def _show_help(self) -> None:
+        """Show available commands"""
+        print("\nAvailable commands:")
+        print("  new <filename>: Create a new markdown file")
+        print("  edit <filename>: Edit an existing file")
+        print("  chat: Start an interactive chat with Llama")
+        print("  tools: Access troubleshooting and maintenance tools")
+        print("  help: Show available commands")
+        print("  exit: Exit the application\n")
 
     def _handle_chat_command(self) -> None:
         """Handle the 'chat' command - interactive conversation with Llama"""
@@ -478,38 +401,6 @@ class LlamaAgent:
                 print("\nExiting chat mode...")
                 break
 
-    def _handle_list_command(self) -> None:
-        """Handle the 'list' command"""
-        documents = self.document_manager.documents
-        
-        if not documents:
-            print("\nNo documents found.")
-            return
-            
-        print("\nAvailable documents:")
-        # Sort documents by filename for consistent display
-        for path, doc in sorted(documents.items(), key=lambda x: x[1].filename):
-            # Calculate relative path from docs directory for cleaner display
-            rel_path = os.path.relpath(path, self.document_manager.docs_path)
-            # Get first line of content for preview
-            preview = doc.content.split('\n')[0][:60] + ('...' if len(doc.content.split('\n')[0]) > 60 else '')
-            print(f"  {rel_path}")
-            print(f"    {preview}")
-
-    def _show_help(self) -> None:
-        """Show available commands"""
-        print("\nAvailable commands:")
-        print("  new <filename>: Create a new markdown file")
-        print("  edit <filename>: Edit an existing file")
-        print("  list: Show all documents")
-        print("  chat: Start an interactive chat with Llama")
-        print("  archive: Clean up all backup files")
-        print("  update-knowledge: Update vector store with document embeddings")
-        print("  reset-knowledge: Reset vector store, clearing all documents")
-        print("  help: Show this help message")
-        print("  search <query>: Search knowledge base for relevant documents")
-        print("  exit: Exit the application")
-
     def _handle_new_command(self, filename: str) -> None:
         """Handle the 'new' command"""
         try:
@@ -532,12 +423,7 @@ class LlamaAgent:
             return
             
         print(f"\nEditing {filename}")
-        print("\nAvailable commands:")
-        print("  suggest: Get suggestions from Llama")
-        print("  suggest <focus>: Get focused suggestions")
-        print("  view: View current content")
-        print("  save <content>: Save new content")
-        print("  back: Return to main menu")
+        self._show_edit_help()
         
         while True:
             try:
@@ -545,27 +431,36 @@ class LlamaAgent:
                 
                 if not cmd:
                     continue
-                    
                 if cmd == 'back':
                     break
-                    
                 if cmd == 'view':
                     print("\nCurrent content:")
                     print(doc.content)
                     continue
-                    
                 if cmd.startswith('suggest'):
                     self._handle_suggest_command(cmd, doc)
                     continue
-                    
                 if cmd.startswith('save '):
                     self._handle_save_command(cmd[5:], doc)
                     continue
-                    
+                if cmd == 'help':
+                    self._show_edit_help()
+                    continue
                 print("\nUnknown command. Type 'back' to return to main menu.")
                     
             except KeyboardInterrupt:
                 break
+
+    def _show_edit_help(self) -> None:
+        """Show help information for edit mode"""
+        print("\nAvailable commands:")
+        print("  suggest: Get suggestions from Llama")
+        print("  suggest <focus>: Get focused suggestions")
+        print("  view: View current content")
+        print("  save <content>: Save new content")
+        print("  help: Show available commands")
+        print("  back: Return to main menu\n")
+
     def _handle_suggest_command(self, cmd: str, doc: Document) -> None:
         """Handle the 'suggest' command in edit mode"""
         try:
@@ -632,6 +527,144 @@ class LlamaAgent:
             
         # Reload the document
         self.document_manager.load_document(doc.path)
+
+    def _handle_tools_command(self) -> None:
+        """Handle the 'tools' command - troubleshooting and maintenance tools"""
+        print("\nEntering tools mode.")
+        self._show_tools_help()
+        
+        while True:
+            try:
+                cmd = prompt('tools> ').strip()
+                
+                if not cmd:
+                    continue
+                if cmd == 'back':
+                    break
+                if cmd == 'update':
+                    asyncio.run(self._update_knowledge())
+                    continue
+                if cmd == 'reset':
+                    asyncio.run(self._reset_knowledge())
+                    continue
+                if cmd.startswith('search '):
+                    asyncio.run(self._search_knowledge(cmd[7:]))
+                    continue
+                if cmd == 'archive':
+                    self._handle_archive_command()
+                    continue
+                if cmd == 'list':
+                    self._handle_list_command()
+                    continue
+                if cmd == 'help':
+                    self._show_tools_help()
+                    continue
+                print("\nUnknown command. Type 'back' to return to main menu.")
+                    
+            except KeyboardInterrupt:
+                break
+
+    def _show_tools_help(self) -> None:
+        """Show available commands"""
+        print("\nAvailable commands:")
+        print("  update: Update knowledge base embeddings")
+        print("  reset: Reset knowledge base")
+        print("  search <query>: Search through documents")
+        print("  archive: Clean up backup files")
+        print("  list: List all documents")
+        print("  help: Show available commands")
+        print("  back: Return to main menu\n")
+
+    def _handle_list_command(self) -> None:
+        """Handle the 'list' command"""
+        documents = self.document_manager.documents
+        
+        if not documents:
+            print("\nNo documents found.")
+            return
+            
+        print("\nAvailable documents:")
+        # Sort documents by filename for consistent display
+        for path, doc in sorted(documents.items(), key=lambda x: x[1].filename):
+            # Calculate relative path from docs directory for cleaner display
+            rel_path = os.path.relpath(path, self.document_manager.docs_path)
+            # Get first line of content for preview
+            preview = doc.content.split('\n')[0][:60] + ('...' if len(doc.content.split('\n')[0]) > 60 else '')
+            print(f"  {rel_path}")
+            print(f"    {preview}")
+
+    async def _search_knowledge(self, query: str) -> None:
+        """Search the vector store for relevant documents"""
+        try:
+            print("\nSearching knowledge base...")
+            results = await self.vector_store.query(query)
+            
+            if not results:
+                print("No relevant documents found.")
+                return
+                
+            print(f"\nFound {len(results)} relevant documents:")
+            for i, result in enumerate(results, 1):
+                print(f"\n{i}. {result['metadata']['filename']} (similarity: {1 - result['distance']:.2f})")
+                print("-" * 40)
+                print(result['document'][:300] + "..." if len(result['document']) > 300 else result['document'])
+        except Exception as e:
+            print(f"\nError searching knowledge base: {str(e)}")
+            
+    async def _update_knowledge(self) -> None:
+        """Update the vector store with document embeddings"""
+        try:
+            print("\nUpdating knowledge base...")
+            docs_path = os.path.join(self.project_path, 'docs')
+            await self.vector_store.add_documents(docs_path)
+            print("Knowledge base updated successfully!")
+        except Exception as e:
+            print(f"\nError updating knowledge base: {str(e)}")
+
+    async def _reset_knowledge(self) -> None:
+        """Reset the vector store, clearing all documents"""
+        try:
+            print("\nResetting knowledge base...")
+            self.vector_store.reset()
+            print("Knowledge base reset successfully!")
+        except Exception as e:
+            print(f"\nError resetting knowledge base: {str(e)}")
+
+    def _handle_archive_command(self) -> None:
+        """Handle the 'archive' command - clean up backup files"""
+        backup_dir = os.path.join(
+            self.project_path,
+            self.config_manager.editing_config.backup_dir
+        )
+        
+        if not os.path.exists(backup_dir):
+            print("\nNo backup directory found.")
+            return
+            
+        backup_count = 0
+        try:
+            # Walk through backup directory and remove .bak files
+            for root, _, files in os.walk(backup_dir):
+                for file in files:
+                    if file.endswith('.bak'):
+                        file_path = os.path.join(root, file)
+                        os.remove(file_path)
+                        backup_count += 1
+                        
+            # Remove empty directories
+            for root, dirs, files in os.walk(backup_dir, topdown=False):
+                for dir_name in dirs:
+                    dir_path = os.path.join(root, dir_name)
+                    if not os.listdir(dir_path):  # if directory is empty
+                        os.rmdir(dir_path)
+                        
+            if backup_count > 0:
+                print(f"\nCleaned up {backup_count} backup files.")
+            else:
+                print("\nNo backup files found.")
+                
+        except Exception as e:
+            print(f"\nError cleaning up backups: {str(e)}")
 
     def cleanup(self) -> None:
         """Cleanup resources"""
